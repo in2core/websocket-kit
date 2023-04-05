@@ -1,14 +1,26 @@
 import XCTest
 import NIO
 import NIOHTTP1
+import NIOSSL
 import NIOWebSocket
 @testable import WebSocketKit
 
 final class WebSocketKitTests: XCTestCase {
     func testWebSocketEcho() throws {
+        let server = try ServerBootstrap.webSocket(on: self.elg) { req, ws in
+            ws.onText { ws, text in
+                ws.send(text)
+            }
+        }.bind(host: "localhost", port: 0).wait()
+
+        guard let port = server.localAddress?.port else {
+            XCTFail("couldn't get port from \(server.localAddress.debugDescription)")
+            return
+        }
+
         let promise = elg.next().makePromise(of: String.self)
         let closePromise = elg.next().makePromise(of: Void.self)
-        WebSocket.connect(to: "ws://echo.websocket.org", on: elg) { ws in
+        WebSocket.connect(to: "ws://localhost:\(port)", on: elg) { ws in
             ws.send("hello")
             ws.onText { ws, string in
                 promise.succeed(string)
@@ -17,18 +29,7 @@ final class WebSocketKitTests: XCTestCase {
         }.cascadeFailure(to: promise)
         try XCTAssertEqual(promise.futureResult.wait(), "hello")
         XCTAssertNoThrow(try closePromise.futureResult.wait())
-    }
-    
-    func testWebSocketWithTLSEcho() throws {
-        let promise = elg.next().makePromise(of: String.self)
-        WebSocket.connect(to: "wss://echo.websocket.org", on: elg) { ws in
-            ws.send("hello")
-            ws.onText { ws, string in
-                promise.succeed(string)
-                ws.close(promise: nil)
-            }
-        }.cascadeFailure(to: promise)
-        try XCTAssertEqual(promise.futureResult.wait(), "hello")
+        try server.close(mode: .all).wait()
     }
 
     func testBadHost() throws {
@@ -36,8 +37,6 @@ final class WebSocketKitTests: XCTestCase {
     }
 
     func testServerClose() throws {
-        let port = Int.random(in: 8000..<9000)
-
         let sendPromise = self.elg.next().makePromise(of: Void.self)
         let serverClose = self.elg.next().makePromise(of: Void.self)
         let clientClose = self.elg.next().makePromise(of: Void.self)
@@ -47,7 +46,12 @@ final class WebSocketKitTests: XCTestCase {
                     ws.close(promise: serverClose)
                 }
             }
-        }.bind(host: "localhost", port: port).wait()
+        }.bind(host: "localhost", port: 0).wait()
+
+        guard let port = server.localAddress?.port else {
+            XCTFail("couldn't get port from \(server.localAddress.debugDescription)")
+            return
+        }
 
         WebSocket.connect(to: "ws://localhost:\(port)", on: self.elg) { ws in
             ws.send("close", promise: sendPromise)
@@ -61,8 +65,6 @@ final class WebSocketKitTests: XCTestCase {
     }
 
     func testClientClose() throws {
-        let port = Int.random(in: 8000..<9000)
-
         let sendPromise = self.elg.next().makePromise(of: Void.self)
         let serverClose = self.elg.next().makePromise(of: Void.self)
         let clientClose = self.elg.next().makePromise(of: Void.self)
@@ -71,7 +73,12 @@ final class WebSocketKitTests: XCTestCase {
                 ws.send(text)
             }
             ws.onClose.cascade(to: serverClose)
-        }.bind(host: "localhost", port: port).wait()
+        }.bind(host: "localhost", port: 0).wait()
+
+        guard let port = server.localAddress?.port else {
+            XCTFail("couldn't get port from \(server.localAddress.debugDescription)")
+            return
+        }
 
         WebSocket.connect(to: "ws://localhost:\(port)", on: self.elg) { ws in
             ws.send("close", promise: sendPromise)
@@ -89,8 +96,6 @@ final class WebSocketKitTests: XCTestCase {
     }
 
     func testImmediateSend() throws {
-        let port = Int.random(in: 8000..<9000)
-
         let promise = self.elg.next().makePromise(of: String.self)
         let server = try ServerBootstrap.webSocket(on: self.elg) { req, ws in
             ws.send("hello")
@@ -98,7 +103,12 @@ final class WebSocketKitTests: XCTestCase {
                 promise.succeed(string)
                 ws.close(promise: nil)
             }
-        }.bind(host: "localhost", port: port).wait()
+        }.bind(host: "localhost", port: 0).wait()
+
+        guard let port = server.localAddress?.port else {
+            XCTFail("couldn't get port from \(server.localAddress.debugDescription)")
+            return
+        }
 
         WebSocket.connect(to: "ws://localhost:\(port)", on: self.elg) { ws in
             ws.onText { ws, string in
@@ -111,36 +121,46 @@ final class WebSocketKitTests: XCTestCase {
         try server.close(mode: .all).wait()
     }
 
-    func testWebSocketPong() throws {
-        let port = Int.random(in: 8000..<9000)
-
+    func testWebSocketPingPong() throws {
+        let pingPromise = self.elg.next().makePromise(of: String.self)
         let pongPromise = self.elg.next().makePromise(of: String.self)
+        let pingPongData = ByteBuffer(bytes: "Vapor rules".utf8)
+        
         let server = try ServerBootstrap.webSocket(on: self.elg) { req, ws in
             ws.onPing { ws in
-                ws.close(promise: nil)
+                pingPromise.succeed("ping")
             }
-        }.bind(host: "localhost", port: port).wait()
+        }.bind(host: "localhost", port: 0).wait()
+
+        guard let port = server.localAddress?.port else {
+            XCTFail("couldn't get port from \(server.localAddress.debugDescription)")
+            return
+        }
 
         WebSocket.connect(to: "ws://localhost:\(port)", on: self.elg) { ws in
-            ws.send(raw: Data(), opcode: .ping)
+            ws.send(raw: pingPongData.readableBytesView, opcode: .ping)
             ws.onPong { ws in
                 pongPromise.succeed("pong")
                 ws.close(promise: nil)
             }
         }.cascadeFailure(to: pongPromise)
 
+        try XCTAssertEqual(pingPromise.futureResult.wait(), "ping")
         try XCTAssertEqual(pongPromise.futureResult.wait(), "pong")
         try server.close(mode: .all).wait()
     }
 
     func testErrorCode() throws {
-        let port = Int.random(in: 8000..<9000)
-
         let promise = self.elg.next().makePromise(of: WebSocketErrorCode.self)
 
         let server = try ServerBootstrap.webSocket(on: self.elg) { req, ws in
             ws.close(code: .normalClosure, promise: nil)
-        }.bind(host: "localhost", port: port).wait()
+        }.bind(host: "localhost", port: 0).wait()
+
+        guard let port = server.localAddress?.port else {
+            XCTFail("couldn't get port from \(server.localAddress.debugDescription)")
+            return
+        }
 
         WebSocket.connect(to: "ws://localhost:\(port)", on: self.elg) { ws in
             ws.onText { ws, string in
@@ -157,23 +177,62 @@ final class WebSocketKitTests: XCTestCase {
     }
 
     func testHeadersAreSent() throws {
-        let port = Int.random(in: 8000..<9000)
-
-        let promise = self.elg.next().makePromise(of: String.self)
-
+        let promiseAuth = self.elg.next().makePromise(of: String.self)
+        
+        // make sure there are no unwanted headers such as `Content-Length` or `Content-Type`
+        let promiseHasUnwantedHeaders = self.elg.next().makePromise(of: Bool.self)
+        
         let server = try ServerBootstrap.webSocket(on: self.elg) { req, ws in
-            promise.succeed(req.headers.first(name: "Auth")!)
+            let headers = req.headers
+
+            promiseAuth.succeed(headers.first(name: "Auth")!)
+
+            let hasUnwantedHeaders = (
+                headers.contains(name: "Content-Length") ||
+                headers.contains(name: "Content-Type")
+            )
+            promiseHasUnwantedHeaders.succeed(hasUnwantedHeaders)
+
             ws.close(promise: nil)
-        }.bind(host: "localhost", port: port).wait()
+        }.bind(host: "localhost", port: 0).wait()
+
+        guard let port = server.localAddress?.port else {
+            XCTFail("couldn't get port from \(server.localAddress.debugDescription)")
+            return
+        }
 
         WebSocket.connect(
             to: "ws://localhost:\(port)",
             headers: ["Auth": "supersecretsauce"],
             on: self.elg) { ws in
                 _ = ws.close()
+            }.cascadeFailure(to: promiseAuth)
+
+        try XCTAssertEqual(promiseAuth.futureResult.wait(), "supersecretsauce")
+        try XCTAssertFalse(promiseHasUnwantedHeaders.futureResult.wait())
+        try server.close(mode: .all).wait()
+    }
+    
+    func testQueryParamsAreSent() throws {
+        let promise = self.elg.next().makePromise(of: String.self)
+
+        let server = try ServerBootstrap.webSocket(on: self.elg) { req, ws in
+            promise.succeed(req.uri)
+            ws.close(promise: nil)
+        }.bind(host: "localhost", port: 0).wait()
+
+        guard let port = server.localAddress?.port else {
+            XCTFail("couldn't get port from \(server.localAddress.debugDescription)")
+            return
+        }
+
+        WebSocket.connect(
+            to: "ws://localhost:\(port)?foo=bar&bar=baz",
+            on: self.elg) { ws in
+                _ = ws.close()
         }.cascadeFailure(to: promise)
 
-        try XCTAssertEqual(promise.futureResult.wait(), "supersecretsauce")
+        try XCTAssertEqual(promise.futureResult.wait(), "/?foo=bar&bar=baz")
         try server.close(mode: .all).wait()
     }
 
@@ -212,6 +271,33 @@ final class WebSocketKitTests: XCTestCase {
         print("Waiting for server close...")
         try server.close(mode: .all).wait()
     }
+    
+    func testIPWithTLS() throws {
+        let server = try ServerBootstrap.webSocket(on: self.elg, tls: true) { req, ws in
+            _ = ws.close()
+        }.bind(host: "127.0.0.1", port: 0).wait()
+
+        var tlsConfiguration = TLSConfiguration.makeClientConfiguration()
+        tlsConfiguration.certificateVerification = .none
+        
+        let client = WebSocketClient(
+            eventLoopGroupProvider: .shared(self.elg),
+            configuration: .init(
+                tlsConfiguration: tlsConfiguration
+            )
+        )
+
+        guard let port = server.localAddress?.port else {
+            XCTFail("couldn't get port from \(server.localAddress.debugDescription)")
+            return
+        }
+
+        try client.connect(scheme: "wss", host: "127.0.0.1", port: port) { ws in
+            ws.close(promise: nil)
+        }.wait()
+        
+        try server.close(mode: .all).wait()
+    }
 
     var elg: EventLoopGroup!
     override func setUp() {
@@ -226,9 +312,20 @@ final class WebSocketKitTests: XCTestCase {
 extension ServerBootstrap {
     static func webSocket(
         on eventLoopGroup: EventLoopGroup,
+        tls: Bool = false,
         onUpgrade: @escaping (HTTPRequestHead, WebSocket) -> ()
     ) -> ServerBootstrap {
-        ServerBootstrap(group: eventLoopGroup).childChannelInitializer { channel in
+        return ServerBootstrap(group: eventLoopGroup).childChannelInitializer { channel in
+            if tls {
+                let (cert, key) = generateSelfSignedCert()
+                let configuration = TLSConfiguration.makeServerConfiguration(
+                    certificateChain: [.certificate(cert)],
+                    privateKey: .privateKey(key)
+                )
+                let sslContext = try! NIOSSLContext(configuration: configuration)
+                let handler = NIOSSLServerHandler(context: sslContext)
+                _ = channel.pipeline.addHandler(handler)
+            }
             let webSocket = NIOWebSocketServerUpgrader(
                 shouldUpgrade: { channel, req in
                     return channel.eventLoop.makeSucceededFuture([:])

@@ -1,3 +1,7 @@
+import NIOCore
+import NIOHTTP1
+import Foundation
+
 extension WebSocket {
     public static func connect(
         to url: String,
@@ -31,6 +35,7 @@ extension WebSocket {
             host: url.host ?? "localhost",
             port: url.port ?? (scheme == "wss" ? 443 : 80),
             path: url.path,
+            query: url.query,
             headers: headers,
             configuration: configuration,
             on: eventLoopGroup,
@@ -43,6 +48,7 @@ extension WebSocket {
         host: String,
         port: Int = 80,
         path: String = "/",
+        query: String? = nil,
         headers: HTTPHeaders = [:],
         configuration: WebSocketClient.Configuration = .init(),
         on eventLoopGroup: EventLoopGroup,
@@ -56,6 +62,7 @@ extension WebSocket {
             host: host,
             port: port,
             path: path,
+            query: query,
             headers: headers,
             onUpgrade: onUpgrade
         )

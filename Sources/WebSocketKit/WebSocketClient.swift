@@ -4,6 +4,8 @@ import NIOConcurrencyHelpers
 import NIOHTTP1
 import NIOWebSocket
 import NIOSSL
+import NIOTransportServices
+import Atomics
 
 public final class WebSocketClient {
     public enum Error: Swift.Error, LocalizedError {
@@ -36,7 +38,7 @@ public final class WebSocketClient {
     let eventLoopGroupProvider: EventLoopGroupProvider
     let group: EventLoopGroup
     let configuration: Configuration
-    let isShutdown = NIOAtomic.makeAtomic(value: false)
+    let isShutdown = ManagedAtomic(false)
 
     public init(eventLoopGroupProvider: EventLoopGroupProvider, configuration: Configuration = .init()) {
         self.eventLoopGroupProvider = eventLoopGroupProvider
@@ -54,17 +56,19 @@ public final class WebSocketClient {
         host: String,
         port: Int,
         path: String = "/",
+        query: String? = nil,
         headers: HTTPHeaders = [:],
         onUpgrade: @escaping (WebSocket) -> ()
     ) -> EventLoopFuture<Void> {
         assert(["ws", "wss"].contains(scheme))
         let upgradePromise = self.group.next().makePromise(of: Void.self)
-        let bootstrap = ClientBootstrap(group: self.group)
+        let bootstrap = WebSocketClient.makeBootstrap(on: self.group)
             .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_NODELAY), value: 1)
             .channelInitializer { channel in
                 let httpHandler = HTTPInitialRequestHandler(
                     host: host,
                     path: path,
+                    query: query,
                     headers: headers,
                     upgradePromise: upgradePromise
                 )
@@ -93,9 +97,14 @@ public final class WebSocketClient {
                 if scheme == "wss" {
                     do {
                         let context = try NIOSSLContext(
-                            configuration: self.configuration.tlsConfiguration ?? .forClient()
+                            configuration: self.configuration.tlsConfiguration ?? .makeClientConfiguration()
                         )
-                        let tlsHandler = try NIOSSLClientHandler(context: context, serverHostname: host)
+                        let tlsHandler: NIOSSLClientHandler
+                        do {
+                            tlsHandler = try NIOSSLClientHandler(context: context, serverHostname: host)
+                        } catch let error as NIOSSLExtraError where error == .cannotUseIPAddressInSNI {
+                            tlsHandler = try NIOSSLClientHandler(context: context, serverHostname: nil)
+                        }
                         return channel.pipeline.addHandler(tlsHandler).flatMap {
                             channel.pipeline.addHTTPClientHandlers(leftOverBytesStrategy: .forwardBytes, withClientUpgrade: config)
                         }.flatMap {
@@ -127,12 +136,30 @@ public final class WebSocketClient {
         case .shared:
             return
         case .createNew:
-            if self.isShutdown.compareAndExchange(expected: false, desired: true) {
+            if self.isShutdown.compareExchange(
+                expected: false,
+                desired: true,
+                ordering: .relaxed
+            ).exchanged {
                 try self.group.syncShutdownGracefully()
             } else {
                 throw WebSocketClient.Error.alreadyShutdown
             }
         }
+    }
+    
+    private static func makeBootstrap(on eventLoop: EventLoopGroup) -> NIOClientTCPBootstrapProtocol {
+        #if canImport(Network)
+        if let tsBootstrap = NIOTSConnectionBootstrap(validatingGroup: eventLoop) {
+            return tsBootstrap
+        }
+       #endif
+
+       if let nioBootstrap = ClientBootstrap(validatingGroup: eventLoop) {
+           return nioBootstrap
+       }
+
+       fatalError("No matching bootstrap found")
     }
 
     deinit {
@@ -140,7 +167,7 @@ public final class WebSocketClient {
         case .shared:
             return
         case .createNew:
-            assert(self.isShutdown.load(), "WebSocketClient not shutdown before deinit.")
+            assert(self.isShutdown.load(ordering: .relaxed), "WebSocketClient not shutdown before deinit.")
         }
     }
 }
